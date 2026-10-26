@@ -2,15 +2,33 @@
 #include "hv_defeat_0506.h"
 #include "hv_defeat_0607.h"
 #include "hv_defeat_1320.h"
+#include "hv_defeat_1360.h"
 #include "loader.h"
 #include "prepare_resume.h"
 #include "utils.h"
+#include <signal.h>
 #include <unistd.h>
 
+static void diag_sig(int sig, siginfo_t *si, void *ctx) {
+  (void)ctx;
+  notify("!! signal %d at %p (code %d).\n", sig, si ? si->si_addr : 0,
+         si ? si->si_code : 0);
+  _exit(128 + sig);
+}
+
 int main(void) {
+  struct sigaction sa;
+  sa.sa_sigaction = diag_sig;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGTRAP, &sa, 0);
+  sigaction(SIGSEGV, &sa, 0);
+  sigaction(SIGBUS, &sa, 0);
+  sigaction(SIGILL, &sa, 0);
+  sigaction(SIGFPE, &sa, 0);
   if (setup_env()) {
-    notify("Something went wrong while initiating.\nPlease make sure your fw "
-           "is supported.");
+    notify("Something went wrong during initialization.\nPlease make sure "
+           "your fw is supported.");
     return -1;
   }
 
@@ -20,11 +38,22 @@ int main(void) {
   }
 
   int is_1320 = 0;
-  void *shellcode_kernel;
-  size_t shellcode_kernel_len;
-  if (prepare_resume(&shellcode_kernel, &shellcode_kernel_len)) {
-    notify("Something went wrong while preparing resume.\n");
-    return -1;
+  int is_1360 = 0;
+  void *shellcode_kernel = NULL;
+  size_t shellcode_kernel_len = 0;
+  if (fw < 0x0800) {
+    /* Legacy vectors hand off to shellcode_kernel via the ACPI-wakeup ROP, so
+     * it must be staged in the kernel cave before sleeping. */
+    if (prepare_resume(&shellcode_kernel, &shellcode_kernel_len)) {
+      notify("Something went wrong while preparing resume.\n");
+      return -1;
+    }
+  } else {
+    /* The 13.20/13.60 (Byepervisor khook) vectors boot via shellcode_hv staged
+     * from post_resume(); they never use shellcode_kernel, so skip the legacy
+     * kernel cave staging + page-table rewrite entirely (fewer arm-time
+     * deviations). */
+    notify("high fw: skipping legacy shellcode_kernel staging.\n");
   }
 
   if ((0x0300 <= fw) && (fw < 0x0500)) {
@@ -36,6 +65,10 @@ int main(void) {
   } else if ((0x0650 <= fw) && (fw < 0x0800)) {
     if (hv_defeat_0607(shellcode_kernel, shellcode_kernel_len))
       goto err;
+  } else if (fw == 0x1360) {
+    if (hv_defeat_1360())
+      goto err;
+    is_1360 = 1;
   } else if ((0x0800 <= fw) && (fw < 0x1400)) {
     if (hv_defeat_1320(shellcode_kernel, shellcode_kernel_len))
       goto err;
@@ -51,10 +84,12 @@ int main(void) {
   sleep(5);
   enter_rest_mode();
 
-  /* On 13.20 the console comes back from rest mode with NPT disabled; finish
-   * the takeover from here (runs on the BSP once we wake). */
+  /* On 13.20/13.60 the console comes back from rest mode with NPT disabled;
+   * finish the takeover from here (runs on the BSP once we wake). */
   if (is_1320)
     hv_defeat_1320_post_resume();
+  if (is_1360)
+    hv_defeat_1360_post_resume();
 
   while (1) {
     sleep(30);

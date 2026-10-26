@@ -1,22 +1,31 @@
 /*
  * kdlsym.c -- vendored and adapted from Byepervisor-Reborn (AGPL-3.0-or-later).
  *
- * Original Byepervisor keeps its own per-firmware sym/gadget maps; here the
- * same lookups are served from pLinux5-NG's env_offset (populated for 13.20 by
+ * Lookups prefer the firmware's Byepervisor table (source/offsets/byepervisor/)
+ * when one exists, and otherwise fall back to pLinux5-NG's env_offset (the
+ * linux offset_list, which carries the byepervisor fields for 13.20 via
  * off_1320). Gadgets/symbols resolve to absolute kernel text addresses via
  * ktext_addr(), and kdldmap() mirrors the kernel direct map.
  */
 #include <stdio.h>
 #include <ps5/kernel.h>
 
+#include "byepervisor.h"
 #include "kdlsym.h"
 #include "utils.h"
 
 uint64_t ktext_addr(uint64_t offset) { return ktext + offset; }
 
+/* The Byepervisor table for the running firmware, or NULL if none is ported. */
+static const bp_offsets *bp_cur(void) { return bp_get((uint16_t)fw); }
+
 uint64_t kgadget(kgadget_t gadget) {
   if (gadget >= KERNEL_GADGET_MAX)
     return 0;
+
+  const bp_offsets *bp = bp_cur();
+  if (bp)
+    return ktext_addr(bp->gadget[gadget]);
 
   switch (gadget) {
   case KERNEL_GADGET_PIVOT_ADD_RSP28_RET:
@@ -70,6 +79,15 @@ uint64_t kdlsym(ksym_t sym) {
   if (sym >= KERNEL_SYM_MAX)
     return 0;
 
+  const bp_offsets *bp = bp_cur();
+  if (bp) {
+    /* HV symbols (HEAP_BASE/PCPUS) are hypervisor-image offsets, not kernel
+     * text; every other symbol is ktext-relative. */
+    if (sym >= HV_SYM_HEAP_BASE)
+      return bp->sym[sym];
+    return ktext_addr(bp->sym[sym]);
+  }
+
   switch (sym) {
   case KERNEL_SYM_DMPML4I:
     return ktext_addr(env_offset.KERNEL_SYM_DMPML4I);
@@ -105,6 +123,10 @@ uint64_t kdlsym(ksym_t sym) {
 uint64_t rawoff(ksym_t sym) {
   if (sym >= KERNEL_SYM_MAX)
     return 0;
+
+  const bp_offsets *bp = bp_cur();
+  if (bp && sym >= HV_SYM_HEAP_BASE)
+    return bp->sym[sym];
 
   switch (sym) {
   case HV_SYM_HEAP_BASE:
